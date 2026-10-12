@@ -17,7 +17,9 @@ import subprocess
 import serial
 import serial.tools.list_ports
 
-BIN = r"T:\AS\bishe501\17_led_test\Objects\step17_led.bin"
+# ★ 2026-10-12：改成相对脚本自身定位，clone 到任何目录都能跑（以前写死了作者的 T 盘路径）
+BASE = os.path.dirname(os.path.abspath(__file__))
+BIN = os.path.join(BASE, "17_led_test", "Objects", "step17_led.bin")
 # ★★★ 2026-10-06：19200 优先（用户实测这是能成功的最快波特率）；已取消 2400
 BAUDS = [38400, 19200, 9600, 115200, 57600, 4800]
 

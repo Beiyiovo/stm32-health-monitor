@@ -53,3 +53,8 @@ desktop.ini
 
 # Keil 每次 Build 覆盖生成的日志，内容含本机编译器路径（如 T:\TE\ARM\...）
 build_log.txt
+
+# 运行时产物
+日志/
+__pycache__/
+*.pyc

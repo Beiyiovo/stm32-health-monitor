@@ -10,7 +10,7 @@
   · ★ 每小时打一行统计（收到多少字节、多少条数据、有没有异常）
   · Ctrl+C 安全退出（会写一段总结）
 
-输出位置：T:\\AS\\bishe501\\日志\\
+输出位置：本脚本同目录下的 `日志\` 文件夹（会自动创建）
     501log_20261006_2200.txt    ← 按启动时间命名
     501log_20261006_2300.txt    ← 满 1 小时自动新建
 
@@ -28,7 +28,9 @@ except ImportError:
     print("需要 pyserial")
     sys.exit(1)
 
-LOGDIR = r"T:\AS\bishe501\日志"
+# ★ 2026-10-12：改成相对脚本自身定位，clone 到任何目录都能跑（以前写死了作者的 T 盘路径）
+BASE = os.path.dirname(os.path.abspath(__file__))
+LOGDIR = os.path.join(BASE, "日志")
 BAUD = 115200
 
 

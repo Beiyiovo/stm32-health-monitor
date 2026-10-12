@@ -7,7 +7,9 @@
 import io, os, shutil, sys, time
 sys.stdout.reconfigure(encoding="utf-8")
 
-OBJ = r"T:\AS\bishe501\09_main\Objects"
+# ★ 2026-10-12：改成相对脚本自身定位，clone 到任何目录都能跑（以前写死了作者的 T 盘路径）
+BASE = os.path.dirname(os.path.abspath(__file__))
+OBJ = os.path.join(BASE, "09_main", "Objects")
 
 ALGOS = [
     ("1", "peak",    "方案1  用【峰】计心率",

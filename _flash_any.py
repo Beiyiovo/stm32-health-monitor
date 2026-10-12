@@ -23,9 +23,93 @@ import serial
 import serial.tools.list_ports
 
 LINE = "=" * 64
-BASE = r"T:\AS\bishe501"
-UV4 = r"T:\TE\UV4\UV4.exe"
-FROMELF = r"T:\TE\ARM\ARMCLANG\bin\fromelf.exe"
+
+
+# ============================================================
+#  路径探测（★ 2026-10-12 改）
+#  以前这里写死了作者本机的路径，别人 clone 下来直接跑不了。
+#  现在按 环境变量 → Keil 注册表 → 常见安装目录 顺序自动找。
+# ============================================================
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _keil_reg_paths():
+    """
+    读 Keil 注册表里 Products\\MDK 的 Path。
+    ★ 坑：这个值通常指向 <Keil根>\\ARM，不是 Keil 根目录本身
+      （本机实测：T:\\TE\\ARM）。所以下面既把它当根试，也把它的父目录当根试。
+    """
+    out = []
+    try:
+        import winreg
+        for hive, key in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Keil\Products\MDK"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Keil\Products\MDK"),
+            (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Keil\Products\MDK"),
+        ):
+            try:
+                with winreg.OpenKey(hive, key) as k:
+                    p, _ = winreg.QueryValueEx(k, "Path")
+                    if p:
+                        out.append(p.rstrip("\\/"))
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return out
+
+
+def _candidate_roots():
+    """按可信度依次给出可能的 Keil 根目录（去重保序）。"""
+    roots = []
+    for env in ("KEIL_ROOT", "KEIL_MDK_ROOT"):
+        v = os.environ.get(env)
+        if v and os.path.isdir(v):
+            roots.append(v.rstrip("\\/"))
+    for p in _keil_reg_paths():
+        roots.append(p)                 # 当成是 <root>\ARM
+        parent = os.path.dirname(p)
+        if parent:
+            roots.append(parent)        # 当成是 <root>
+    roots += [r"C:\Keil_v5", r"C:\Keil", r"D:\Keil_v5", r"D:\Keil",
+              r"E:\Keil_v5", r"T:\TE", r"T:\Keil_v5"]
+    seen, out = set(), []
+    for r in roots:
+        if r and r.lower() not in seen:
+            seen.add(r.lower())
+            out.append(r)
+    return out
+
+
+def _find_uv4():
+    v = os.environ.get("KEIL_UV4")
+    if v and os.path.exists(v):
+        return v
+    for root in _candidate_roots():
+        for rel in (("UV4", "UV4.exe"), ("UV4", "uv4.exe")):
+            p = os.path.join(root, *rel)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def _find_fromelf():
+    v = os.environ.get("KEIL_FROMELF")
+    if v and os.path.exists(v):
+        return v
+    for root in _candidate_roots():
+        # 注册表给的多半是 <root>\ARM，所以先试 ARMCLANG 直接挂在上面的写法
+        for rel in (("ARMCLANG", "bin", "fromelf.exe"),
+                    ("ARM", "ARMCLANG", "bin", "fromelf.exe"),
+                    ("ARM", "ARMCC", "bin", "fromelf.exe")):
+            p = os.path.join(root, *rel)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+UV4 = _find_uv4()
+FROMELF = _find_fromelf()
 
 # ★★★ 2026-10-06 用户实测：19200 是【能成功的最快波特率】
 #   烧 27KB 固件：19200 约 15 秒，9600 约 30 秒 → 快一倍
@@ -137,6 +221,37 @@ print(LINE)
 print("      501 毕设 —— 通用烧录工具 v5")
 print("      ★ 回到最初成功的方案（先扫描，再烧录）")
 print(LINE)
+print()
+
+# ---------- 环境自检（★ 2026-10-12 新增：路径找不到时给清楚提示，而不是莫名报错） ----------
+_missing = []
+if not os.path.isdir(BASE):
+    _missing.append("脚本目录 BASE = %s" % BASE)
+if not UV4:
+    _missing.append("Keil 命令行编译器 UV4.exe")
+if not FROMELF:
+    _missing.append("fromelf.exe（用来把 .axf 转成 .bin）")
+
+if _missing:
+    print("  X 环境不完整，缺这几样：")
+    for m in _missing:
+        print("      - %s" % m)
+    print()
+    print("  怎么解决：")
+    print("    1. 装 Keil MDK-ARM（UV4.exe 和 fromelf.exe 都随它一起装）")
+    print("    2. 如果 Keil 装在非常规目录，先指定它的根目录再运行本文件：")
+    print("         set KEIL_ROOT=D:\\你的Keil目录")
+    print("       也可以单独指定：")
+    print("         set KEIL_UV4=D:\\Keil_v5\\UV4\\UV4.exe")
+    print("         set KEIL_FROMELF=D:\\Keil_v5\\ARM\\ARMCLANG\\bin\\fromelf.exe")
+    print()
+    input("按回车退出...")
+    sys.exit(1)
+
+print("  环境自检 OK")
+print("    Keil UV4   : %s" % UV4)
+print("    fromelf    : %s" % FROMELF)
+print("    工程根目录 : %s" % BASE)
 print()
 
 # ---------- 找工程 ----------

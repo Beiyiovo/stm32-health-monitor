@@ -1,0 +1,13 @@
+# bishe501 辅助脚本的依赖（Keil 本身不需要，这些是串口/烧录工具用的）
+#
+# 安装：
+#     pip install -r requirements.txt
+#
+# 说明：
+#   pyserial     —— 串口通信（serial / serial.tools.list_ports），所有脚本都依赖
+#   stm32loader  —— STM32 系统 bootloader（串口 ISP）烧录，_flash_any.py 用
+#
+# 注意：stm32loader 是以模块方式调用的（python -m stm32loader），不是命令行工具。
+
+pyserial>=3.5
+stm32loader>=0.7.1
