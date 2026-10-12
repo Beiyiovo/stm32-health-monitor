@@ -51,7 +51,7 @@ desktop.ini
 # Keil 需要时会自己重新展开，不用传。
 *.base@*
 
-# Keil 每次 Build 覆盖生成的日志，内容含本机编译器路径（如 T:\TE\ARM\...）
+# Keil 每次 Build 覆盖生成的日志，内容含编译器的本机绝对路径
 build_log.txt
 
 # 运行时产物
