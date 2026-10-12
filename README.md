@@ -70,6 +70,10 @@ set KEIL_UV4=D:\Keil_v5\UV4\UV4.exe
 set KEIL_FROMELF=D:\Keil_v5\ARM\ARMCLANG\bin\fromelf.exe
 ```
 
+> **通用版已独立成仓库：[stm32-serial-flash](https://github.com/Beiyiovo/stm32-serial-flash)**
+> 那个版本不绑定本项目的 24 个工程，任何 Keil 工程都能用，带完整 CLI。
+> 本仓库这份是**针对本项目的定制版**（带工程编号 + 中文说明表），日常用起来更顺手。
+
 ---
 
 ## 硬件
