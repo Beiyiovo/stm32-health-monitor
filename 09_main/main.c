@@ -37,6 +37,7 @@
 #include "ds18b20.h"
 #include "mpu6050.h"
 #include "max30102.h"
+#include "sleep.h"          /* ★ 2026-10-23 睡眠检测 */
 #include "alert.h"
 
 /* ==================== 全局数据 ==================== */
@@ -58,6 +59,35 @@ static uint8_t  g_esp_ok   = 0;         /* ESP32 是否就绪 */
  *              排查问题时改成 1 重新编译即可
  */
 #define DETAILED_DEBUG  0
+
+/* ★★★ 2026-10-23 新增：睡眠标定打印开关
+ *
+ * 打开后会【每分钟】往串口打印一行：
+ *   [SLEEP] act=42mg now=15mg hr=68 base=72 quiet=3 active=0 st=0
+ *
+ * 字段含义：
+ *   act    = 这一分钟的平均活动量（mg）—— ★ 判"安静"靠它
+ *   now    = 最近一次瞬时活动量（mg）
+ *   hr     = 当前心率（0 = 无效/手指没放）
+ *   base   = 心率基线（清醒时缓慢更新，睡眠中冻结）
+ *   quiet  = 已连续多少分钟"安静 + 心率低"
+ *   active = 已连续多少分钟"明显活动"
+ *   st     = 0 清醒 / 1 睡眠中
+ *
+ * ★★★ 【怎么用它标定 sleep.c 里的阈值】
+ *
+ *   第 1 步：清醒静坐，看 act 大概多少 → 记作 A_wake
+ *   第 2 步：躺床上不动，看 act 降到多少 → 记作 A_sleep
+ *   第 3 步：翻身时看 now 的峰值 → 记作 A_move
+ *   第 4 步：清醒静坐看 hr，入睡 10 分钟后再看 hr → 差值记作 D
+ *
+ *   然后按下面规则调 sleep.c 顶部的宏：
+ *     SL_QUIET_THRESH  = (A_sleep + A_wake) / 2     取中间值最稳
+ *     SL_ACTIVE_THRESH = A_move / 2                  翻身峰值的 1/2
+ *     SL_HR_DROP       = D / 2                       心率降幅的一半
+ *
+ *   ★ 标定完成后把这个开关改回 0（省 Flash 和串口带宽）*/
+#define SLEEP_CALIB_DEBUG  1
 
 static uint32_t s_info_until = 0;       /* 信息页显示截止的 millis() 时间戳 */
 static uint8_t  s_key_msg    = 0;       /* 最近按下的键（1/2/3），0 = 无 */
@@ -133,6 +163,91 @@ static void ds_task(void)
             s_ds_state = DS_IDLE;
             break;
     }
+}
+
+/* ==================== 辅助：把毫秒格式化成 "H:MM" ====================
+ *  ★ 2026-10-23 新增（睡眠时长显示用）
+ *
+ *  ★ 为什么手动拼字符而不用 sprintf("%02lu")：
+ *    Keil 的 printf 库对宽度/补零格式会拉进额外代码（几百字节），
+ *    这里只有 5 个字符，手动算更省 Flash。
+ * ================================================================= */
+static void fmt_dur(char *buf, uint32_t ms)
+{
+    uint32_t sec = ms / 1000UL;
+    uint32_t h   = sec / 3600UL;
+    uint32_t mn  = (sec % 3600UL) / 60UL;
+
+    if (h > 99) { h = 99; mn = 59; }        /* 上限保护 */
+
+    if (h >= 10) {
+        buf[0] = (char)('0' + (h / 10));
+        buf[1] = (char)('0' + (h % 10));
+        buf[2] = ':';
+        buf[3] = (char)('0' + (mn / 10));
+        buf[4] = (char)('0' + (mn % 10));
+        buf[5] = '\0';
+    } else {
+        buf[0] = (char)('0' + h);
+        buf[1] = ':';
+        buf[2] = (char)('0' + (mn / 10));
+        buf[3] = (char)('0' + (mn % 10));
+        buf[4] = '\0';
+    }
+}
+
+/* ==================== ★ CRC8 校验（2026-10-23 新增，额外功能 E6）====================
+ *
+ *  算法：CRC-8, polynomial=0x07, init=0x00（通用标准）
+ *
+ *  【为什么加】
+ *    串口 + 无线传输都可能出错（尤其 24 小时连续跑、或者线长有干扰）。
+ *    原来 App 会照单全收，一个 bit 翻转就可能让心率显示成 191 这种离谱值。
+ *    加了 CRC 后，App 可以丢弃坏帧。
+ *
+ *  【帧格式】
+ *    数据行：$HR=76,SPO2=97,TEMP=25.3,STEP=4,SLEEP=0,SDUR=0,UP=3600*3F
+ *                                                                     ↑
+ *                                                              CRC8 两位十六进制
+ *
+ *  【★ 兼容性】
+ *    App 端做成了「有 * 才校验，没有就跳过」——
+ *    所以老固件（没 CRC）配新 App 也能跑，只是没有校验保护。
+ * ========================================================================== */
+
+static uint8_t crc8_calc(const char *s, uint16_t len)
+{
+    uint8_t crc = 0x00;
+    uint8_t i;
+    while (len--) {
+        crc ^= (uint8_t)(*s++);
+        for (i = 0; i < 8; i++) {
+            if (crc & 0x80) crc = (uint8_t)((crc << 1) ^ 0x07);
+            else            crc = (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/**
+ * 在字符串末尾追加 CRC 和换行：  ...*XX\r\n
+ *  ★ 手动转十六进制（不用 sprintf 的 %02X）—— 省几百字节 printf 库代码
+ *  @param buf  已拼好的内容（不含 \r\n）
+ *  @param len  buf 里有效字符数
+ *  @return 追加后的总长度
+ */
+static uint16_t append_crc(char *buf, uint16_t len)
+{
+    static const char HEX[] = "0123456789ABCDEF";
+    uint8_t crc = crc8_calc(buf, len);
+
+    buf[len++] = '*';
+    buf[len++] = HEX[(crc >> 4) & 0x0F];
+    buf[len++] = HEX[crc & 0x0F];
+    buf[len++] = '\r';
+    buf[len++] = '\n';
+    buf[len]   = '\0';
+    return len;
 }
 
 /* ==================== OLED 显示 ==================== */
@@ -215,28 +330,45 @@ static void oled_build(void)   /* ★ 只操作显存，发送靠主循环分页
         max30102_get_debug(&dg);
         oled_clear();
         oled_draw_cn(32, 0, "系统信息");
-        oled_draw_str(0, 2, "Sample:");
-        sprintf(buf, "%lu", (unsigned long)dg.sample_cnt);
-        oled_draw_str(54, 2, buf);
-        oled_draw_str(0, 3, "Overflow:");
-        sprintf(buf, "%u", dg.fifo_ovf);
-        oled_draw_str(66, 3, buf);
-        oled_draw_str(0, 4, "Peaks:");
-        sprintf(buf, "%u", dg.peak_cnt);
-        oled_draw_str(54, 4, buf);
-        oled_draw_str(0, 5, "WiFi:");
-        oled_draw_str(42, 5, g_esp_ok ? "OK" : "--");
-        oled_draw_str(0, 6, "Alert:");
-        oled_draw_str(48, 6, g_alert == ALERT_NONE ? "None" : "YES");
-        oled_draw_str(0, 7, alert_is_muted() ? "MUTE ON" : "MUTE OFF");
+
+        /* ★ 2026-10-23：原来 page2 显示 Sample、page4 显示 Peaks（调试用），
+         *   改成显示睡眠信息。Overflow 保留（它反映数据质量，有价值）。*/
+        {
+            sleep_data_t sd;
+            sleep_get_data(&sd);
+
+            oled_draw_str(0, 2, "Sleep:");
+            oled_draw_str(48, 2, (sd.state == SLEEP_SLEEPING) ? "YES" : "NO");
+
+            oled_draw_str(0, 3, "Dur:");            /* 本次睡眠时长 */
+            fmt_dur(buf, (sd.state == SLEEP_SLEEPING) ? sd.sleep_ms : sd.last_dur_ms);
+            oled_draw_str(36, 3, buf);
+
+            oled_draw_str(0, 4, "Total:");          /* 开机以来累计 */
+            fmt_dur(buf, sd.total_sleep_ms);
+            oled_draw_str(48, 4, buf);
+
+            oled_draw_str(0, 5, "Overflow:");       /* 保留：反映 FIFO 丢样本 */
+            sprintf(buf, "%u", dg.fifo_ovf);
+            oled_draw_str(66, 5, buf);
+
+            oled_draw_str(0, 6, "WiFi:");
+            oled_draw_str(42, 6, g_esp_ok ? "OK" : "--");
+
+            oled_draw_str(0, 7, alert_is_muted() ? "MUTE ON" : "MUTE OFF");
+        }
         return;                     /* 信息页占满整屏，直接返回 */
     }
 
     /* ================= 右下角小状态 ================= */
     if (g_alert != ALERT_NONE) {
-        oled_draw_str(100, 7, "ALERT");
+        oled_draw_str(98,  7, "ALERT")   /* ★ 98+5*6=128，刚好放下 */;
+    } else if (sleep_get_state() == SLEEP_SLEEPING) {
+        /* ★ 2026-10-23 新增：睡眠中优先显示 SLEEP（WIFI 状态此时不重要）
+         *   ★ 详细睡眠时长在 KEY3 系统信息页里看 */
+        oled_draw_str(98,  7, "SLEEP")   /* ★ 98+5*6=128，刚好放下 */;
     } else if (g_esp_ok) {
-        oled_draw_str(112, 7, "WIFI");
+        oled_draw_str(104, 7, "WIFI")    /* ★ 104+4*6=128，刚好放下 */;
     }
 
     /* ★ 这里【不】调 oled_refresh()，由主循环分页发送 */
@@ -395,25 +527,27 @@ static uint8_t esp_init(void)
  * 把一行数据通过 ESP32 发给手机
  * 流程：AT+CIPSEND=0,<len> → 等 '>' → 发数据 → 等 SEND OK
  */
-static void esp_send_data(const char *line)
+static int esp_send_data(const char *line)
 {
     char cmd[32];
     int  len = (int)strlen(line);
     int  i;
 
-    if (!g_esp_ok) return;
+    if (!g_esp_ok) return 0;
 
     sprintf(cmd, "AT+CIPSEND=0,%d", len);
 
     if (!esp_cmd_wait(cmd, ">", 400)) {    /* ★ 1500->400ms，避免长时间阻塞导致 FIFO 溢出 */
         /* 没回 '>' —— 多半是手机还没连 */
-        return;
+        return 0;
     }
 
     uart2_send(line);
     (void)i;
 
-    esp_cmd_wait("", "SEND OK", 2000);
+    /* ★ 2026-10-31：把是否收到 SEND OK 返回给调用者，
+     *   睡眠事件靠它判断「发出去了才出队」，否则断线会丢事件。 */
+    return esp_cmd_wait("", "SEND OK", 2000);
 }
 
 /* ==================== 主程序 ==================== */
@@ -421,7 +555,9 @@ int main(void)
 {
     /* uint32_t tick = 0;  ★ 已废弃：全部定时改用 millis() 真实时间 */              /* 主循环计数，每次 10ms */
     uint32_t n_send = 0;
-    char     line[64];
+    /* ★ 2026-10-23：加睡眠字段(SLEEP/SDUR)后再加 UP（设备运行秒数），
+     *   最坏约 78 字符 → 改 96 留余量 */
+    char     line[96];
     uint8_t  i;
     uint8_t  alert_printed = 0;
     uint8_t  s_oled_page = 0;       /* ★ 分页刷新用的当前页号 */
@@ -447,6 +583,7 @@ int main(void)
     bsp_init();
     uart1_init();
     i2c_init();
+    sleep_init();                    /* ★ 2026-10-23 睡眠检测初始化 */
 
     /* ★★★ 2026-10-06 关键修复：漏了这一行！
        uart2_init() 必须显式调用（bsp_init() 内部【没有】调用它）。
@@ -598,6 +735,33 @@ int main(void)
         if ((millis() - s_last_ped) >= 25) {
             s_last_ped = millis();
             g_steps = pedometer_update();
+
+            /* ★ 2026-10-23：睡眠检测（体动 + 心率双判据）
+             *   · 体动 = mpu6050_get_activity()（动态加速度 mg）
+             *   · 心率 = g_max.hr（无效时 hr_valid = 0）
+             *   ★ 必须在 pedometer_update() 之后调用，否则活动量还是上一拍的 */
+            sleep_update(mpu6050_get_activity(), g_max.hr, g_max.hr_valid);
+
+#if SLEEP_CALIB_DEBUG
+            /* ★ 每分钟打印一次睡眠算法内部状态（标定阈值用）
+             *   ★ 为什么 60 秒才打一次：睡眠判据本身就是分钟级的，
+             *     打印太频繁既没用又会拖慢主循环（串口阻塞约 1~2ms/行）*/
+            {
+                static uint32_t s_last_sleep_dbg = 0;
+                if ((millis() - s_last_sleep_dbg) >= 60000UL) {
+                    s_last_sleep_dbg = millis();
+                    {
+                        sleep_data_t sd;
+                        sleep_get_data(&sd);
+                        printf("[SLEEP] act=%ldmg now=%ldmg hr=%u base=%u quiet=%u active=%u st=%u\r\n",
+                               (long)sd.act_avg, (long)sd.act_now,
+                               (unsigned)sd.hr_cur, (unsigned)sd.hr_base,
+                               (unsigned)sd.quiet_min, (unsigned)sd.active_min,
+                               (unsigned)sd.state);
+                    }
+                }
+            }
+#endif
         }
 
         /* --- 每 100ms（10 拍） --- */
@@ -620,7 +784,9 @@ int main(void)
             {
                 uint8_t tv = g_temp_valid;
                 if (tv && (g_temp10 < TEMP_VALID_MIN)) tv = 0;      /* ★ 探头未接触 */
-                g_alert = alert_update(g_max.hr, g_max.hr_valid, g_temp10, tv);
+                /* ★ 2026-10-23：加了血氧两个参数（额外功能 E5 低血氧告警）*/
+    g_alert = alert_update(g_max.hr, g_max.hr_valid, g_temp10, tv,
+                           g_max.spo2, g_max.spo2_valid);
             }
 
             /* 告警状态变化时打印一次（避免刷屏） */
@@ -786,17 +952,91 @@ int main(void)
             s_last_send = millis();
             n_send++;
 
+            /* ========================================================
+             * ★ 2026-10-23 新增：先补发【睡眠状态变化事件】（如果有）
+             *
+             * 【为什么要单独发事件】
+             *   STM32 没有 RTC，只知道"开机后第几毫秒入睡了"，
+             *   不知道"几点几分"。
+             *   → 所以把事件（START/END）+ 相对时间发给 App，
+             *     App 用【手机系统时间】打绝对时间戳。
+             *
+             * 【断线怎么办】
+             *   sleep.c 里有 10 条的环形缓存，断线期间事件先存着，
+             *   重连后这里会一条条补发出去。
+             *
+             * ★ 每次只发一条，避免阻塞主循环（事件不会很多，一天也就几次）
+             * ======================================================== */
+            {
+                uint8_t  evt_type = 0;
+                uint32_t evt_ms   = 0;
+                if (sleep_peek_event(&evt_type, &evt_ms)) {
+                    {
+                        int n_evt = sprintf(line, "$EVT=%u,T=%lu",
+                                            (unsigned)evt_type,
+                                            (unsigned long)(evt_ms / 1000UL));
+                        if (n_evt > 0 && n_evt < 90) {
+                            append_crc(line, (uint16_t)n_evt);
+                            /* ★ 2026-10-31：发送成功才出队。
+                             *   原来 pop 之后无条件发送，断线时这条事件就没了，
+                             *   "断线补发"名不副实。改成 peek → 发 → 成功才 pop。*/
+                            if (esp_send_data(line)) {
+                                sleep_pop_event((uint8_t *)0, (uint32_t *)0);
+                                printf("  [睡眠事件] type=%u  t=%lus 已上报\r\n",
+                                       (unsigned)evt_type,
+                                       (unsigned long)(evt_ms / 1000UL));
+                            } else {
+                                printf("  [睡眠事件] 没发出去，留在缓存等重连补发\r\n");
+                            }
+                        } else {
+                            /* 长度异常，丢掉这一条避免卡死 */
+                            sleep_pop_event((uint8_t *)0, (uint32_t *)0);
+                        }
+                    }
+                }
+            }
+
             /* 拼数据行 */
             {
                 uint8_t hr   = g_max.hr_valid   ? g_max.hr   : 0;
                 uint8_t spo2 = g_max.spo2_valid ? g_max.spo2 : 0;
                 int     t10  = g_temp_valid ? (int)g_temp10 : 0;
 
-                sprintf(line, "$HR=%u,SPO2=%u,TEMP=%d.%d,STEP=%u\r\n",
-                        hr, spo2,
-                        t10 / 10,
-                        (t10 % 10 < 0) ? -(t10 % 10) : (t10 % 10),
-                        (unsigned)g_steps);
+                /* ★ 2026-10-23：追加睡眠字段
+                 *   SLEEP = 0 清醒 / 1 睡眠中
+                 *   SDUR  = 本次睡眠已持续多少秒（非睡眠时为 0）
+                 *
+                 * ★★ 为什么传"相对时长"而不是"绝对时间"：
+                 *   STM32 没有 RTC（全工程无 RTC 代码），拿不到"几点"。
+                 *   → App 收到后用【手机系统时间】打绝对时间戳。
+                 *   → 断线时 STM32 用事件缓存（sleep_pop_event）补传。*/
+                /* ★ 2026-10-23：再追加 UP = 设备开机以来运行了多少秒
+                 *
+                 * 【App 为什么需要它】
+                 *   App 收到睡眠事件 $EVT=1,T=1800（设备第 1800 秒入睡）时，
+                 *   要换算成"手机时间几点几分"。
+                 *   单纯用"收到时刻"会在断线补发时出错。
+                 *   → 有 UP 后，App 可以：
+                 *        绝对时间 = 收到本行数据时的手机时间
+                 *                 - 本行的UP
+                 *                 + 事件的T
+                 *     这样即使事件是断线期间产生的，也能算准。*/
+                /* ★ 2026-10-23：改用手动加 CRC 的方式（额外功能 E6）
+                 *   ★ sprintf 这里【不再带 \r\n】，由 append_crc 统一追加 "*XX\r\n" */
+                int n_raw = sprintf(line, "$HR=%u,SPO2=%u,TEMP=%d.%d,STEP=%u,SLEEP=%u,SDUR=%lu,UP=%lu",
+                                    hr, spo2,
+                                    t10 / 10,
+                                    (t10 % 10 < 0) ? -(t10 % 10) : (t10 % 10),
+                                    (unsigned)g_steps,
+                                    (unsigned)sleep_get_state(),
+                                    (unsigned long)(sleep_get_duration_ms() / 1000UL),
+                                    (unsigned long)(millis() / 1000UL));
+                if (n_raw > 0 && n_raw < 90) {
+                    append_crc(line, (uint16_t)n_raw);
+                } else {
+                    /* 拼装异常（理论上不会发生），至少补上换行别把协议搞乱 */
+                    line[0] = '\r'; line[1] = '\n'; line[2] = '\0';
+                }
             }
 
             printf("[%u] %s", (unsigned)n_send, line);
@@ -879,11 +1119,20 @@ int main(void)
                 alert_mute(10000);
                 s_key_msg    = 1;
                 printf("\r\n  [KEY1 短按] ★ 消音 10 秒（红灯照闪）\r\n");
-            } else if (e1 == 2) {                   /* 长按：重启网络 */
-                printf("\r\n  [KEY1 长按] ★ 重新初始化 ESP32 网络...\r\n");
-                s_key_msg = 4;
-                g_esp_ok = esp_init();
-                printf("  [KEY1 长按] 网络%s\r\n", g_esp_ok ? "已恢复" : "仍未连接");
+            } else if (e1 == 2) {                   /* ★ 2026-10-31 改：主动报警 3 秒 */
+                /* 原来这里是"重新初始化 ESP32 网络"（g_esp_ok = esp_init()）。
+                 *
+                 * 【为什么换掉】esp_init() 要跑 6 条 AT 指令，实测耗时约 12 秒，
+                 *   期间整机停摆（BUG-6）。而网络真正挂掉的概率很低，
+                 *   真挂了断电重插即可恢复（AT 配置在开机初始化时下发）。
+                 *   用户判断这个功能"没有意义"，改成主动报警演示。
+                 *
+                 * 【新功能】按一下响 3 秒 + 红灯闪 3 秒，用来演示报警长什么样。
+                 *   ★ 不产生告警事件：OLED 不显示 ALERT，App 也收不到这条记录。
+                 *     要测「断线事件缓存（E4）」必须用真实报警（手捂探头升温）。*/
+                alert_beep_test(3000);
+                s_key_msg = 7;
+                printf("\r\n  [KEY1 长按] ★ 主动报警 3 秒（演示用，不产生告警记录）\r\n");
             }
 
             /* ---------------- KEY2 ---------------- */

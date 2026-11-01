@@ -190,7 +190,13 @@ void buzzer(int on)
  *   记录按下的持续时间，供上层判断"短按"还是"长按"。
  * ==================================================================== */
 
-#define KEY_DEBOUNCE_CNT    3       /* 连续几次一致才算数 */
+/* ★★★ 2026-10-15 修改：3 → 2
+ *   这个常量现在只用于【松开】的消抖（按下改成立即响应了）。
+ *   2 拍 × 45ms = 90ms，足够滤掉松手瞬间的触点抖动，
+ *   又不会让"快速按键"被误判。
+ *   ★ 背景：用户反馈"按太快没反应，要按一秒左右"——
+ *     原来按下要 3 拍（135ms）才认，快速按键还没被认就松开了，事件完全丢失。*/
+#define KEY_DEBOUNCE_CNT    2       /* 松开时连续几次一致才算数 */
 
 /* ★★★ 2026-10-07：长按判定时间（毫秒）
  *   原来 3000ms，改成 2000ms —— 按着 3 秒有点久，2 秒既不会误触短按，操作也不累。
@@ -219,26 +225,85 @@ static uint8_t key_raw(uint8_t idx)
     return (GPIO_ReadInputDataBit(GPIOA, pin) == Bit_RESET) ? 1 : 0;
 }
 
-/* 消抖更新（每次主循环调一次）*/
-static void key_poll(void)
+/* ★ 消抖更新 —— 只更新【指定的一个键】
+ *
+ * 【★★★ 2026-10-15 关键设计说明（改过两次，这里说清楚为什么是这样）】
+ *
+ * 问题背景：
+ *   main.c 每轮主循环连续调用 key_get_event(1) / (2) / (3)。
+ *   如果每个调用都去更新【全部 3 个键】，那同一轮循环内每个键的
+ *   same_cnt 会被 +3 → 一拍就凑满 KEY_DEBOUNCE_CNT(3)
+ *   → ★ 消抖窗口从设计值 135ms 被压缩到 1 轮主循环（约 45ms）
+ *   → 机械按键 5~20ms 的触点弹跳没被滤掉。
+ *
+ * ✅ 本实现的做法（最终版）：
+ *   key_get_event(i) 只调用 key_poll_one(i) —— 只更新自己那一个键。
+ *   于是每个键每轮主循环【正好被更新 1 次】：
+ *        1 拍 = 45ms，3 拍 = 135ms  ★ 正好等于设计值
+ *   · 不需要任何"时间闸门"，没有隐式状态
+ *   · 采样节奏与调用顺序、调用次数完全无关
+ *
+ * ⚠️ 曾经用过的写法（已废弃，记录备查）：
+ *   在函数开头加 `if (millis() - s_poll_ms < 10) return;`
+ *   —— 在当前 45ms 主循环下能工作，但如果哪天主循环周期缩到 ≤10ms，
+ *      闸门会【每拍都挡住】→ 按键全部失效。所以换成了现在的单键更新。
+ */
+static void key_poll_one(uint8_t i)
 {
-    uint8_t i;
-    for (i = 0; i < 3; i++) {
-        uint8_t raw = key_raw(i);
+    uint8_t raw;
 
-        if (raw == s_keys[i].last_raw) {
-            if (s_keys[i].same_cnt < KEY_DEBOUNCE_CNT) s_keys[i].same_cnt++;
-        } else {
-            s_keys[i].last_raw = raw;
+    if (i > 2) return;
+
+    raw = key_raw(i);
+
+    if (raw) {
+        /* ================= 按下：★ 立即响应（不等消抖）=================
+         *
+         * ★★★ 2026-10-15 关键改进（用户实测反馈驱动）
+         *
+         * 【为什么改成立即响应】
+         *   原来要求"连续 KEY_DEBOUNCE_CNT 次采样一致"才认状态变化，
+         *   主循环约 45ms/拍 → 按下要 3 拍 = 135ms 才被认。
+         *   ★ 用户快速按一下（<135ms）时，还没被认成"按下"就已经松开，
+         *     于是 press_ms 从来没被设置过 → ★★ 这次按键【完全丢失】。
+         *   ★ 实测现象：用户说"按太快没反应，得按一秒左右才生效"。
+         *
+         * 【为什么按下可以不等消抖】
+         *   按下是【主动动作】—— 手指持续施加压力，触点一旦闭合就会被压住，
+         *   抖动主要发生在闭合的几毫秒内；而我们的采样间隔 45ms 远大于抖动时长，
+         *   所以单次采到低电平基本就是真的按下了。
+         *   ★ 松开相反：松手瞬间触点会弹跳，必须消抖（见下面的 else 分支）。
+         *
+         * 【代价】如果按下瞬间恰好采到抖动中的高电平，press_ms 会晚一拍（45ms）。
+         *   对"短按/长按"的判定无影响（长按判定是 2000ms 量级）。*/
+        if (!s_keys[i].last_raw) {
+            s_keys[i].press_ms = millis();      /* ★ 记下按下时刻（同一拍就记）*/
+        }
+        s_keys[i].last_raw = 1;
+        s_keys[i].stable   = 1;                 /* ★ 立即置为"已按下" */
+        s_keys[i].same_cnt = 0;                 /* 重置松开计时 */
+
+    } else {
+        /* ================= 松开：消抖确认（滤掉触点弹跳）================= */
+        if (s_keys[i].last_raw) {               /* 从"按下"变"松开"的第一拍 */
+            s_keys[i].last_raw = 0;
             s_keys[i].same_cnt = 1;
+        } else if (s_keys[i].same_cnt < KEY_DEBOUNCE_CNT) {
+            s_keys[i].same_cnt++;
         }
 
-        /* 连续 3 次一致 → 更新稳定状态 */
-        if (s_keys[i].same_cnt >= KEY_DEBOUNCE_CNT && s_keys[i].stable != raw) {
-            s_keys[i].stable = raw;
-            if (raw) s_keys[i].press_ms = millis();     /* 记下按下时刻 */
+        /* 连续 KEY_DEBOUNCE_CNT 拍都是松开 → 才认"真的松开了" */
+        if (s_keys[i].same_cnt >= KEY_DEBOUNCE_CNT) {
+            s_keys[i].stable = 0;
         }
     }
+}
+
+/* ★ 更新全部 3 个键（只有 key_any_just_pressed 需要）*/
+static void key_poll_all(void)
+{
+    uint8_t i;
+    for (i = 0; i < 3; i++) key_poll_one(i);
 }
 
 /**
@@ -269,7 +334,7 @@ uint8_t key_get_event(uint8_t idx)
 
     if (idx < 1 || idx > 3) return 0;
 
-    key_poll();                     /* 每次查询都先消抖更新 */
+    key_poll_one(i);                /* ★ 只更新自己这个键（每拍 1 次 → 135ms 消抖）*/
 
     if (!s_keys[i].stable) {
         /* --- ★ 已松开：根据按住时长判定 --- */
@@ -300,7 +365,7 @@ uint8_t key_any_just_pressed(void)
     static uint8_t prev_stable[3] = { 0, 0, 0 };
     uint8_t i, ret = 0;
 
-    key_poll();                     /* 先消抖更新 */
+    key_poll_all();                 /* ★ 这个接口要判断"任意键"，所以全部更新 */
 
     for (i = 0; i < 3; i++) {
         /* ★ 状态从"松开"变成"按下"的那一次 */

@@ -167,11 +167,14 @@
 
 #ifndef HR_ALGO
 #define HR_ALGO  HR_ALGO_VALLEY
+#endif
 
-/* 方案3 的参数（官方参考设计用的值）*/
+/* ★★★ 2026-10-15 修复：这两个宏原来被关在 #ifndef HR_ALGO 里面，
+ *   导致用 -DHR_ALGO=3 编译时整块被跳过 → HAMM_WIN_SIZE/HAMM_BUF_SIZE 未定义
+ *   → 方案3 用 -D 方式【必然编译失败】（只能改源码默认值才能编过）。
+ *   ★ 现在移到外面，三个方案共用，-D 切换算法才能真正可用。*/
 #define HAMM_WIN_SIZE       12      /* 汉明窗长度（官方 HAMMING_SIZE=12）*/
 #define HAMM_BUF_SIZE       100     /* 滑动窗口长度（4 秒 @25Hz，官方 BUFFER_SIZE=100）*/
-#endif
 
 static max30102_data_t g_data;
 
@@ -649,7 +652,7 @@ static void hr_feed_interval(uint32_t interval)
     s_peak_idx = (uint8_t)((s_peak_idx + 1) % HR_BUF_LEN);
     if (s_peak_cnt < HR_BUF_LEN) s_peak_cnt++;
 
-    /* ★ 预热期门槛：手指放上后至少 4 秒才输出心率 */
+    /* ★ 预热期门槛：手指放上后至少 3 秒才输出心率（HR_WARMUP_SAMPLES = 25×3）*/
     if (s_peak_cnt < 4 || s_measure_cnt < HR_WARMUP_SAMPLES) return;
 
     /* --- 步骤 1：求中位数 --- */
@@ -1139,11 +1142,30 @@ static void process_sample(uint32_t red, uint32_t ir)
     if (s_ir_peak_ref > 20 && s_red_peak_ref > 20 &&
         s_ir_dc > 0 && s_red_dc > 0) {
 
-        int32_t ratio_ir  = (s_ir_peak_ref  * 1000) / s_ir_dc;
-        int32_t ratio_red = (s_red_peak_ref * 1000) / s_red_dc;
+        /* ★★★ 2026-10-15 修复：合并两级整数截断
+         *
+         * 【原 bug】原来是两步除法：
+         *     ratio_ir  = ir_peak  × 1000 / ir_dc      ← 截断误差最大 1/20 = 5%
+         *     ratio_red = red_peak × 1000 / red_dc     ← 同样 5%
+         *     R1000     = ratio_red × 1000 / ratio_ir  ← 误差叠加
+         *   实测量级：peak≈3000、dc≈147000 → ratio = 20（真值 20.41）
+         *   ★ 最坏累计误差 ±10%。按官方二次式 dSpO2/dR ≈ −60 折算，
+         *     SpO2 会偏 ±3 个点（任务书 ±5% 的预算被吃掉大半），
+         *     表现为"血氧偶尔跳 1~3 个点"。
+         *
+         * 【修法】改成"先算幅度比、再算直流比"：
+         *     R1000 = (red_ac × 1000 / ir_ac) × ir_dc / red_dc
+         *   第一步乘了 1000，相对误差 ≤ 0.1%；第二步数值大，截断可忽略。
+         *   ★ 总误差从 ~10% 降到 ~0.1%，不需要 int64、不增加 Flash。
+         *
+         * 【溢出保护】red_ac 最大约 40000（实测 ACmax=41871），
+         *   乘 1000 得 4e7，安全；再乘 ir_dc（最大 262143）前
+         *   用 100~3000 的合理 R 区间夹住，最坏 3000×262143 = 7.9e8 < 2.1e9 ✅ */
+        int32_t amp_ratio1000 = (s_red_peak_ref * 1000) / s_ir_peak_ref;
 
-        if (ratio_ir > 0) {
-            int32_t R1000 = (ratio_red * 1000) / ratio_ir;      /* R × 1000 */
+        /* R 的合理范围约 0.3~2.0（超出说明信号异常，丢弃不输出）*/
+        if (amp_ratio1000 >= 100 && amp_ratio1000 <= 3000) {
+            int32_t R1000 = (amp_ratio1000 * s_ir_dc) / s_red_dc;   /* R × 1000 */
             int32_t spo2;
 
             /* ================================================================

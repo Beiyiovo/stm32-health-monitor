@@ -23,6 +23,18 @@ void    mpu6050_accel_g(int16_t ax, int16_t ay, int16_t az,
 void    mpu6050_angle(int16_t ax, int16_t ay, int16_t az,
                       int16_t *pitch10, int16_t *roll10);
 
+/* ---- ★ 2026-10-23 新增：给睡眠检测用的活动量 ---- */
+
+/**
+ * 最近一次的动态加速度（mg，已取绝对值）
+ * ★ 含义：合加速度减去 1g 重力后的绝对值，反映"体动强度"
+ *   · 静止放置：约 0~10 mg
+ *   · 轻微移动：几十 mg
+ *   · 翻身/走动：几百 mg
+ * ★ 数据来源：pedometer_update() 每次计算后保存，所以必须先调用过计步
+ */
+int32_t mpu6050_get_activity(void);
+
 /* ---- 计步 ---- */
 void     pedometer_init(void);
 uint32_t pedometer_update(void);        /* ★ 周期调用（建议 20~50ms），返回累计步数 */

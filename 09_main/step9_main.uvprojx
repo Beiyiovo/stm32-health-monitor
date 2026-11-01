@@ -134,11 +134,11 @@
             <RunIndependent>0</RunIndependent>
             <UpdateFlashBeforeDebugging>1</UpdateFlashBeforeDebugging>
             <Capability>1</Capability>
-            <DriverSelection>-1</DriverSelection>
+            <DriverSelection>4096</DriverSelection>
           </Flash1>
           <bUseTDR>1</bUseTDR>
           <Flash2>BIN\UL2CM3.DLL</Flash2>
-          <Flash3></Flash3>
+          <Flash3>"" ()</Flash3>
           <Flash4></Flash4>
           <pFcarmOut></pFcarmOut>
           <pFcarmGrp></pFcarmGrp>
@@ -424,6 +424,11 @@
               <FileType>1</FileType>
               <FilePath>..\_common\alert.c</FilePath>
             </File>
+            <File>
+              <FileName>sleep.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\_common\sleep.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -463,6 +468,12 @@
           <targetInfo name="Target_1"/>
         </targetInfos>
       </component>
+      <component Cclass="Device" Cgroup="StdPeriph Drivers" Csub="I2C" Cvendor="Keil" Cversion="3.6.0" condition="STM32F1xx STDPERIPH RCC">
+        <package name="STM32F1xx_DFP" schemaVersion="1.7.2" url="https://www.keil.com/pack/" vendor="Keil" version="2.4.1"/>
+        <targetInfos>
+          <targetInfo name="Target_1"/>
+        </targetInfos>
+      </component>
       <component Cclass="Device" Cgroup="StdPeriph Drivers" Csub="RCC" Cvendor="Keil" Cversion="3.6.0" condition="STM32F1xx STDPERIPH">
         <package name="STM32F1xx_DFP" schemaVersion="1.7.2" url="https://www.keil.com/pack/" vendor="Keil" version="2.4.1"/>
         <targetInfos>
@@ -470,12 +481,6 @@
         </targetInfos>
       </component>
       <component Cclass="Device" Cgroup="StdPeriph Drivers" Csub="USART" Cvendor="Keil" Cversion="3.6.0" condition="STM32F1xx STDPERIPH RCC">
-        <package name="STM32F1xx_DFP" schemaVersion="1.7.2" url="https://www.keil.com/pack/" vendor="Keil" version="2.4.1"/>
-        <targetInfos>
-          <targetInfo name="Target_1"/>
-        </targetInfos>
-      </component>
-      <component Cclass="Device" Cgroup="StdPeriph Drivers" Csub="I2C" Cvendor="Keil" Cversion="3.6.0" condition="STM32F1xx STDPERIPH RCC">
         <package name="STM32F1xx_DFP" schemaVersion="1.7.2" url="https://www.keil.com/pack/" vendor="Keil" version="2.4.1"/>
         <targetInfos>
           <targetInfo name="Target_1"/>
@@ -517,5 +522,14 @@
       </file>
     </files>
   </RTE>
+
+  <LayerInfo>
+    <Layers>
+      <Layer>
+        <LayName>step9_main</LayName>
+        <LayPrjMark>1</LayPrjMark>
+      </Layer>
+    </Layers>
+  </LayerInfo>
 
 </Project>
