@@ -290,13 +290,13 @@ static uint8_t esp_init(void)
     esp_cmd_wait("AT+CIPMUX=1", "OK", 3000);
     delay_ms(200);
 
-    printf("\r\n  [步骤 6/6] 开 TCP 服务器（端口 8080）\r\n");
-    esp_cmd_wait("AT+CIPSERVER=1,8080", "OK", 4000);
+    printf("\r\n  [步骤 6/6] 开 TCP 服务器（端口 8266）\r\n");
+    esp_cmd_wait("AT+CIPSERVER=1,8266", "OK", 4000);
 
     ovf = uart2_get_overflow();
     printf("\r\n  √ ESP32 初始化流程走完（接收溢出 %u 次）\r\n", (unsigned)ovf);
     printf("     热点: HealthHelper / 12345678\r\n");
-    printf("     手机连: 192.168.4.1:8080\r\n\r\n");
+    printf("     手机连: 192.168.4.1:8266\r\n\r\n");
     return 1;
 }
 

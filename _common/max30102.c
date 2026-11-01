@@ -118,13 +118,41 @@
  *   但重搏波高度约主峰的 20~40% → 22% 挡不住它。
  *
  *   26% 能挡掉大部分重搏波，同时弱信号（真峰约主峰 50~100%）仍能通过。
- *   ★ 剩下的重搏波由下面的"整体加倍保护"兜底。 */
-#define PEAK_HEIGHT_PCT     26
+ *   ★ 剩下的重搏波由下面的"整体加倍保护"兜底。
+ *
+ * ★★★ 2026-11-01 第六次调整：26% → 20%
+ *
+ * 【为什么降】实测心率【出 3 帧就掉 0、60 秒不恢复】（8266 端口抓包，
+ *   HR=78 只出现在第 1/3/5 秒，之后 60 秒全 0，同期血氧能在 6 秒后恢复）。
+ *
+ *   追踪到峰检测：稳定期结束时的假大峰（代码 925-935 行注释记录过
+ *   ACmax 达 37618）被 `if (s_ir_peak_ref == 0) s_ir_peak_ref = s_ac_max;`
+ *   直接采信，之后门槛 = 37618 × 26% ≈ 9780，真实峰（约 3000）永远过不了。
+ *   虽然每 2 秒衰减 6%，从 4 倍差距回落到 1 倍要 44 秒 —— 实测 60 秒没解锁。
+ *
+ *   20% 的含义：真峰（呼吸调制后仍在主峰 50~100%）能过，
+ *   重搏波（主峰 20~40%）的下沿刚好被挡住，剩下的靠倍数修正兜底。
+ *   ★ 必须同时改 PEAK_REF_DN_SHIFT 6→4 和 2 秒衰减 >>4→>>3，
+ *     三者配合才让参考峰高"降得下来"，单靠降门槛解决不了假峰锁死。 */
+#define PEAK_HEIGHT_PCT     20
 
 /* ★★★ 参考峰高的跟踪系数（用已确认的峰高做参考，比瞬时 AC 更可靠）
- *   参考值 = 已确认峰高的移动平均，用 >>3（快跟）涨、>>6（慢降）落 */
+ *   参考值 = 已确认峰高的移动平均，用 >>3（快跟）涨、>>4（慢降）落
+ *
+ * ★★★ 2026-11-01 调整：DN_SHIFT 6 → 4
+ *
+ * 【原因①：心率掉 0 不恢复】
+ *   >>6 每次只降 1.6%，参考值一旦被假峰抬高就几乎降不下来。
+ *   改成 >>4 后每次降 6.25%，4 倍差距的恢复时间从 88 秒缩到 22 秒。
+ *
+ * 【原因②：血氧偏低 4~5 点】
+ *   上升 >>3（12.5%）远快于下降 >>6（1.6%）→ s_red_peak_ref 长期虚高
+ *   → R = (RED_ac/IR_ac) × (IR_dc/RED_dc) 里的 RED_ac 偏大 → R 偏大
+ *   → 二次拟合 SpO2 = -4506r²/10000 + 3035r/100 + 9485 后读数偏低。
+ *   实测本机 93~94、指夹式 97~98，差 4~5 点，与此吻合。
+ *   升降对称化之后 R 会回落，血氧读数应回升 3~5 点。 */
 #define PEAK_REF_UP_SHIFT   3
-#define PEAK_REF_DN_SHIFT   6
+#define PEAK_REF_DN_SHIFT   4
 #define HR_MIN_VALID        30
 #define HR_MAX_VALID        200
 
@@ -362,6 +390,22 @@ static int32_t  s_red_ac_base  = 0;     /* RED 通道 AC 的慢速均值 */
 
 static uint16_t s_measure_cnt  = 0;     /* 手指放上后的样本计数 */
 
+/* ★★★ 2026-11-01 新增：心率平滑的余数累加器
+ *
+ * 【为什么需要】原来的平滑是
+ *     g_data.hr = (g_data.hr * 3 + bpm) / 4;
+ *   C 的整数除法【向下取整】，所以只有 bpm ≥ hr + 4 时 hr 才会 +1。
+ *   而 bpm 本身的量化步长是 2~3（因为 avg 是整数样本数，1500/20=75、1500/21=71）。
+ *   → 真实心率 73 时 bpm 只在 71~75 之间跳，平滑后永远卡在 71，
+ *     差值 2 bpm 被截断永久吞掉，表现就是"稳定后完全不变"。
+ *
+ * 【修法】把除法丢掉的小数存起来，下次一起参与运算：
+ *     total = hr*3 + bpm + frac;   hr = total/4;   frac = total%4;
+ *   长期平均等于真实值，且 1 bpm 的变化经过几次累加后能体现出来。
+ *
+ * 【代价】一个字节的静态变量，Flash 增加约 20 字节。 */
+static uint8_t  s_hr_frac      = 0;     /* 心率平滑余数，0~3 */
+
 /* ==================== 初始化 ==================== */
 
 /**
@@ -570,6 +614,7 @@ void max30102_reset_algo(void)
     s_ir_ac_base   = 0;
     s_red_ac_base  = 0;
     s_measure_cnt  = 0;             /* ★ 预热期重新计时 */
+    s_hr_frac      = 0;             /* ★ 2026-11-01 余数累加器归零 */
 
     for (i = 0; i < HR_BUF_LEN; i++) s_peak_interval[i] = 0;
 
@@ -712,11 +757,19 @@ static void hr_feed_interval(uint32_t interval)
 
         if (g_data.hr == 0) {
             g_data.hr = (uint8_t)bpm;                   /* 首次直接给 */
+            s_hr_frac = 0;
         } else {
             int32_t d = (int32_t)bpm - (int32_t)g_data.hr;
             if (d > 10)       bpm = (uint32_t)((int32_t)g_data.hr + 10);
             else if (d < -10) bpm = (uint32_t)((int32_t)g_data.hr - 10);
-            g_data.hr = (uint8_t)(((int32_t)g_data.hr * 3 + (int32_t)bpm) / 4);
+            /* ★ 2026-11-01 修复：保留余数的 3:1 平滑
+             *   原来 (hr*3+bpm)/4 会向下取整，bpm 差 1~3 时 hr 永远不动；
+             *   现在把余数存进 s_hr_frac，下次一起算，小变化也能体现。 */
+            {
+                int32_t total = (int32_t)g_data.hr * 3 + (int32_t)bpm + (int32_t)s_hr_frac;
+                g_data.hr = (uint8_t)(total / 4);
+                s_hr_frac = (uint8_t)(total % 4);
+            }
         }
         g_data.hr_valid = 1;
     }
@@ -781,7 +834,15 @@ static void process_sample(uint32_t red, uint32_t ir)
         s_red_ac_last  = 0;
         s_settle       = (uint16_t)(SAMPLE_RATE);           /* ★ 2026-10-07：1 秒稳定期（DC + 二级高通都收敛）*/
         s_measure_cnt  = 0;                                 /* ★ 预热期重新计时 */
+        s_hr_frac      = 0;                                 /* ★ 2026-11-01 余数累加器归零 */
 
+        /* ★★★ 2026-11-01 撤销"延迟 3 秒清零"：手指离开立即清零。
+         *
+         * 【为什么撤销】原来想延迟 3 秒避免界面闪烁，但副作用更大：
+         *   手指离开前最后几帧信号已经变差，血氧可能被算成 70~80，
+         *   这个低值会残留 3 秒 —— 用户看到的是"手指都拿开了还报低血氧"，
+         *   而且这 3 秒里告警模块每 100 ms 判一次，必然误触发蜂鸣器和红灯。
+         *   立即清零后 OLED 立刻显示"待测量"，告警也不会误报。 */
         g_data.hr = 0;  g_data.spo2 = 0;
         g_data.hr_valid = 0;  g_data.spo2_valid = 0;
         g_data.finger = now_finger;
@@ -845,6 +906,9 @@ static void process_sample(uint32_t red, uint32_t ir)
         g_data.ir = ir;  g_data.red = red;
         g_data.ir_dc = s_ir_dc;
         g_data.ir_ac = (int32_t)ir - s_ir_dc;
+
+        /* ★★★ 2026-11-01：没手指时立即清零（撤销原先的 3 秒保持，
+         *   理由见上方「手指状态变化」分支的注释：保持低值会误触发低血氧告警）*/
         g_data.hr_valid = 0;  g_data.spo2_valid = 0;
         g_data.hr = 0;  g_data.spo2 = 0;
         return;
@@ -913,8 +977,13 @@ static void process_sample(uint32_t red, uint32_t ir)
      *   几秒内就能回落到真实峰高附近，自动"解锁"。
      * ======================================================================== */
     if ((s_sample_cnt % 50) == 0) {                 /* 每 2 秒（25Hz × 50）*/
-        if (s_ir_peak_ref  > 0) s_ir_peak_ref  -= (s_ir_peak_ref  >> 4);   /* 降约 6% */
-        if (s_red_peak_ref > 0) s_red_peak_ref -= (s_red_peak_ref >> 4);
+        /* ★★★ 2026-11-01：衰减速度 >>4（6%）→ >>3（12%）
+         *   原因：实测心率掉 0 后 60 秒不恢复。假峰锁死时参考值可能是
+         *   真实峰高的 4 倍，按 6%/2s 要 44 秒才降到 1 倍，按 12%/2s 只要 22 秒。
+         *   这是"无峰通过门槛时也能自动解锁"的最后一道保险，宁可降快一点
+         *   （降太快只会让门槛变松、偶发误检，由倍数修正和不应期兜底）。 */
+        if (s_ir_peak_ref  > 0) s_ir_peak_ref  -= (s_ir_peak_ref  >> 3);   /* 降约 12% */
+        if (s_red_peak_ref > 0) s_red_peak_ref -= (s_red_peak_ref >> 3);
     }
 
 #if HR_ALGO == HR_ALGO_HAMMING
@@ -1017,12 +1086,26 @@ static void process_sample(uint32_t red, uint32_t ir)
                     int32_t ref   = (s_ir_peak_ref > 0) ? s_ir_peak_ref : s_ac_max;
                     int32_t min_h = (ref * PEAK_HEIGHT_PCT) / 100;
 
-                    /* ★ 自适应下限：不低于 AC 平均幅度的 1.5 倍 */
-                    if (s_ir_ac_base != 0) {
-                        int32_t adap = (s_ir_ac_base < 0) ? -s_ir_ac_base : s_ir_ac_base;
-                        adap = (adap * 3) / 2;
-                        if (adap > min_h && adap < ref) min_h = adap;
-                    }
+                    /* ★★★ 2026-11-01：删除原「自适应下限」代码
+                     *
+                     * 原代码：
+                     *     if (s_ir_ac_base != 0) {
+                     *         int32_t adap = abs(s_ir_ac_base);
+                     *         adap = (adap * 3) / 2;
+                     *         if (adap > min_h && adap < ref) min_h = adap;
+                     *     }
+                     *
+                     * 【为什么删】这段代码从未生效过，而且方向与本意相反：
+                     *  ① 取错了变量。s_ir_ac_base 是「一级高通后 AC 的慢速均值」，
+                     *     AC 本身零均值，这个量只有几十的量级；而 min_h 是几百到几千
+                     *     （26% × 参考峰高），adap 永远小于 min_h，条件不成立。
+                     *  ② 即使换成正确的「AC 峰值幅度」，`adap > min_h` 成立时
+                     *     是把 min_h 【抬高】到 adap —— 而注释写的是「信号弱时门槛
+                     *     自动降低（不漏检）」，方向正好相反。
+                     *
+                     * 【真正的自适应在哪】参考峰高 s_ir_peak_ref 本身就是快涨慢降的
+                     *   移动平均（UP >>3 / DN >>4），信号变弱时它会自然跟下来，
+                     *   门槛随之降低。所以不需要额外的 adap 层。 */
 
                     if (min_h < 20) min_h = 20;
 
@@ -1243,7 +1326,19 @@ static void process_sample(uint32_t red, uint32_t ir)
              *   这两个参考幅度要用【已确认的峰】慢慢建立，前几个峰不准。
              *   出数太快（1~2 秒）时数值会偏差很大（实测出现 85 和 100 这种极端值）。
              *   → 等 6 秒，参考幅度稳定后再输出，数值才可靠。 */
+            /* ★★★ 2026-11-01 新增：单帧跳变抑制（修"手指离开时血氧误报"）
+             *
+             * 【问题】手指刚开始抬起、但 IR 还没跌破 FINGER_THRESHOLD 的那几帧，
+             *   AC 幅度暴跌而 DC 仍然在，R 值会被算得很大 → SpO2 突降到 70~80。
+             *   这个低值喂进 6:1 平滑后会污染读数，并被低血氧告警捕获（< 92 立即响）。
+             *
+             * 【修法】真实血氧在几秒内不可能变化 15 个百分点；
+             *   单帧跳变超过 ±15 就判为信号异常，丢弃本帧、保持旧值。 */
             if (spo2 >= SPO2_MIN_VALID && s_measure_cnt >= SPO2_WARMUP_SAMPLES) {
+                if (g_data.spo2 != 0) {
+                    int32_t d = (int32_t)spo2 - (int32_t)g_data.spo2;
+                    if (d > 15 || d < -15) return;
+                }
                 if (g_data.spo2 == 0) {
                     g_data.spo2 = (uint8_t)spo2;
                 } else {

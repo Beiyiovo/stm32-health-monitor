@@ -39,6 +39,39 @@
 #include "max30102.h"
 #include "sleep.h"          /* ★ 2026-10-23 睡眠检测 */
 #include "alert.h"
+#include <string.h>          /* strstr（巴法云私钥判断） */
+
+/* ==================== 巴法云远程模式配置（2026-11-01 新增） ====================
+ * 【为什么需要】局域网直连要求手机和设备在同一热点内（人要站在设备旁边）。
+ *   远程查看需要云端中转：设备把数据发布到巴法云主题，
+ *   小程序随时随地通过 HTTPS 轮询读取（apis.bemfa.com）。
+ *
+ * 【使用前只需改这 4 行】
+ *   ① console.bemfa.com 免费注册 → 控制台复制「私钥」替换 BEMFA_UID
+ *   ② 控制台「主题管理」新建主题 health004（协议类型选 TCP）
+ *   ③ CLOUD_SSID / CLOUD_PASS 填设备要连的 WiFi（手机热点或路由器，2.4GHz）
+ *   不配置或填错都【不影响】本地直连功能，只是远程模式不可用。
+ *
+ *   小程序端 utils/config.js 的 BEMFA_UID / BEMFA_TOPIC 必须与此处一致。 */
+
+/* ★★★ 2026-11-01 调试开关：0 = 本次编译整体禁用巴法云（不连热点、不发布）
+ *   【为什么需要】cloud_reconnect() 是同步阻塞调用，手机热点不在范围时会卡满
+ *   AT 超时（实测 26~27 秒），期间主循环停摆、MAX30102 的 FIFO 溢出，会把心率
+ *   搞成 0 且长时间不恢复 —— 这个副作用会污染算法本身的验证。
+ *   【怎么用】测算法 / 答辩演示本地直连时置 0；需要远程查看时改回 1 重新编译。
+ *   置 0 后 cloud_configured() 直接返回 0，所有云端函数在第一行就返回，
+ *   既不阻塞主循环，也不影响本地 TCP 与 OLED 显示。 */
+#define CLOUD_ENABLE 0
+
+#define BEMFA_UID    "cb8d43645910466bbbcbcefdc48eea70"   /* ←←← 替换成你的巴法云私钥 */
+#define BEMFA_TOPIC  "health004"              /* 主题名：仅字母数字，末三位 004=传感器类设备 */
+#define CLOUD_SSID   "Ophone X8"  /* ←←← 设备要连接的 WiFi 名称（手机热点/路由器） */
+#define CLOUD_PASS   "Echolove"  /* ←←← 对应的 WiFi 密码 */
+
+static uint8_t cloud_configured(void);            /* 用户是否已填写私钥 */
+static uint8_t cloud_reconnect(void);             /* 建立云端通道：WiFi→TCP→订阅 */
+static void    cloud_publish(const char *line);   /* 把一条协议帧发布到云端 */
+static void    cloud_task(void);                  /* 保活 + 断线重连（主循环调用） */
 
 /* ==================== 全局数据 ==================== */
 static max30102_data_t g_max;           /* 心率血氧 */
@@ -465,7 +498,7 @@ static uint8_t esp_init(void)
     printf("  ESP32 要插自己的 Type-C 供电\r\n\r\n");
 
     /* ---- 步骤 1：先看看 ESP32 上电时喷了什么 ---- */
-    printf("  [步骤 1/6] 先听 1.5 秒，看 ESP32 有没有主动说话...\r\n");
+    printf("  [步骤 1/7] 先听 1.5 秒，看 ESP32 有没有主动说话...\r\n");
     uart2_clear();
     {
         uint8_t i;
@@ -487,7 +520,7 @@ static uint8_t esp_init(void)
     }
 
     /* ---- 步骤 2：发 AT ---- */
-    printf("\r\n  [步骤 2/6] 发 AT 测试\r\n");
+    printf("\r\n  [步骤 2/7] 发 AT 测试\r\n");
     if (!esp_cmd_wait("AT", "OK", 3000)) {
         printf("\r\n  X ESP32 无响应！检查：\r\n");
         printf("     1. A2 → ESP32 右排第 22 孔（GPIO06）\r\n");
@@ -501,25 +534,47 @@ static uint8_t esp_init(void)
     }
 
     /* ---- 步骤 3~6 ---- */
-    printf("\r\n  [步骤 3/6] 设 AP 模式\r\n");
-    esp_cmd_wait("AT+CWMODE=2", "OK", 3000);
+    printf("\r\n  [步骤 3/7] 设 AP+STA 双模式（热点＋连 WiFi 共存）\r\n");
+    esp_cmd_wait("AT+CWMODE=3", "OK", 3000);
     delay_ms(200);
 
-    printf("\r\n  [步骤 4/6] 建热点（这一步 ESP32 要 1~2 秒）\r\n");
+    printf("\r\n  [步骤 4/7] 建热点（这一步 ESP32 要 1~2 秒）\r\n");
     esp_cmd_wait("AT+CWSAP=\"HealthHelper\",\"12345678\",5,3", "OK", 6000);
     delay_ms(300);
 
-    printf("\r\n  [步骤 5/6] 开多连接\r\n");
+    printf("\r\n  [步骤 5/7] 开多连接\r\n");
     esp_cmd_wait("AT+CIPMUX=1", "OK", 3000);
     delay_ms(200);
 
-    printf("\r\n  [步骤 6/6] 开 TCP 服务器（端口 8080）\r\n");
-    esp_cmd_wait("AT+CIPSERVER=1,8080", "OK", 4000);
+    printf("\r\n  [步骤 6/7] 开 TCP 服务器（端口 8266）\r\n");
+    /* ★★★ 2026-11-01 新增：先关掉所有残留连接
+     *
+     * 【为什么】不断电直接烧录（或上次连接没正常断开）时，ESP32 的 conn 0~4
+     *   可能还占着。新客户端连进来会被分配到 conn 1、2...，
+     *   而本地数据发送固定用 `AT+CIPSEND=0` → 永远失败 → 一帧都发不出去。
+     *
+     * 【实测表现】WiFi 能连上（信号 90%）、ping 通、TCP connect 成功，
+     *   但接收零帧 —— 就是这个原因。断电重启能好，但每次烧录都断电太麻烦。 */
+    {
+        uint8_t k;
+        for (k = 0; k < 5; k++) {
+            char cc[24];
+            sprintf(cc, "AT+CIPCLOSE=%u", (unsigned)k);
+            (void)esp_cmd_wait(cc, "OK", 300);
+        }
+    }
+    esp_cmd_wait("AT+CIPSERVER=1,8266", "OK", 4000);
+
+    /* ---- 步骤 7/7：连接巴法云（远程模式，可选）----
+     * 此时尚未初始化 MAX30102（它在所有慢速初始化之后），阻塞安全。
+     * 失败不影响后续流程 —— 远程模式只是附加能力。 */
+    printf("\r\n  [步骤 7/7] 连接巴法云（远程模式，失败不影响本地功能）\r\n");
+    (void)cloud_reconnect();
 
     ovf = uart2_get_overflow();
     printf("\r\n  √ ESP32 初始化流程走完（接收溢出 %u 次）\r\n", (unsigned)ovf);
     printf("     热点: HealthHelper / 12345678\r\n");
-    printf("     手机连: 192.168.4.1:8080\r\n\r\n");
+    printf("     手机连: 192.168.4.1:8266\r\n\r\n");
     return 1;
 }
 
@@ -548,6 +603,164 @@ static int esp_send_data(const char *line)
     /* ★ 2026-10-31：把是否收到 SEND OK 返回给调用者，
      *   睡眠事件靠它判断「发出去了才出队」，否则断线会丢事件。 */
     return esp_cmd_wait("", "SEND OK", 2000);
+}
+
+/* ==================== 巴法云远程模式（2026-11-01 新增） ====================
+ *
+ * 数据通路：STM32 --串口--> ESP32 --TCP--> bemfa.com:8344 --> 云主题
+ *                                    小程序 --HTTPS--> apis.bemfa.com 轮询读取
+ *
+ * 官方协议要点（cloud.bemfa.com/docs/src/tcp.html）:
+ *   · 指令以 \r\n 结尾；订阅 cmd=1，发布 cmd=2
+ *   · 连接后必须尽快订阅主题，否则服务器会断开连接
+ *   · 任意数据都算心跳，超过 65 秒无数据会掉线 —— 本工程 6 秒发布一次
+ *     天然满足；断网恢复后由 cloud_task 自动重连
+ *   · 主题名仅限字母数字，末三位数字决定设备类型（004=传感器）
+ *
+ * 连接号说明：CIPMUX=1 下共 0~4 五个连接。本地 TCP 服务器把接入的手机
+ * 分到 0~3，云端固定用 4，互不冲突。 */
+static uint8_t  g_cloud_ok       = 0;   /* 云端通道就绪 */
+static uint32_t g_last_cloud_ms  = 0;   /* 上次向云端成功发送的时间 */
+static uint32_t g_last_cloud_try = 0;   /* 上次尝试重连的时间 */
+static uint8_t  g_cloud_fail     = 0;   /* 连续发布失败计数 */
+/* ★★★ 2026-11-01 新增：开机重连次数计数（最多 3 次，失败不重试）
+ *   原因：cloud_reconnect() 是同步阻塞，热点不在范围会卡满 AT 超时（实测 27 秒），
+ *   期间主循环停摆、FIFO 溢出，直接把心率搞成 0 且长时间不恢复。 */
+static uint8_t  g_cloud_try      = 0;   /* 已尝试连接的次数（0~3） */
+
+/* 私钥仍是模板占位 → 视为未配置，云端流程整体跳过 */
+static uint8_t cloud_configured(void)
+{
+#if !CLOUD_ENABLE
+    return 0;                            /* 调试期整体禁用巴法云（见文件头说明） */
+#else
+    return (strstr(BEMFA_UID, "PLEASE") == NULL);
+#endif
+}
+
+/* 向指定 TCP 连接号发一段原始文本（自带 \r\n 结尾），1=发送成功 */
+static int esp_send_conn(uint8_t conn, const char *buf, int len)
+{
+    char cmd[32];
+    sprintf(cmd, "AT+CIPSEND=%u,%d", (unsigned)conn, len);
+    if (!esp_cmd_wait(cmd, ">", 400)) return 0;
+    uart2_send(buf);
+    return esp_cmd_wait("", "SEND OK", 2000);
+}
+
+/* 建立/恢复云端通道：WiFi（未连时）→ bemfa TCP → 订阅主题
+ * 任何一步失败都返回 0，由 cloud_task 60 秒后重试。 */
+static uint8_t cloud_reconnect(void)
+{
+    char cmd[128];
+
+    if (!g_esp_ok || !cloud_configured()) return 0;
+
+    /* 1) WiFi：已连时 CWJAP? 回复 +CWJAP:"ssid"；未连回复 No AP。
+     *    只有匹配到 No AP 才真的去连 WiFi（已连时查询超时属正常）。 */
+    if (esp_cmd_wait("AT+CWJAP?", "No AP", 2000)) {
+        printf("  [云] WiFi 未连接，正在连接 \"%s\" ...\r\n", CLOUD_SSID);
+        sprintf(cmd, "AT+CWJAP=\"%s\",\"%s\"", CLOUD_SSID, CLOUD_PASS);
+        /* 手机热点开关时间不一，给足 25 秒 */
+        if (!esp_cmd_wait(cmd, "WIFI CONNECTED", 25000)) {
+            printf("  [云] 连 WiFi 失败（热点开着吗？名称密码对吗？）60 秒后重试\r\n");
+            return 0;
+        }
+        delay_ms(500);                      /* 等 DHCP 分配 IP */
+    }
+
+    /* 2) 连巴法云 TCP 服务器（连接号 4） */
+    sprintf(cmd, "AT+CIPSTART=4,\"TCP\",\"tcp.bemfa.com\",8344");
+    if (!esp_cmd_wait(cmd, "CONNECT", 10000)) {
+        printf("  [云] 连接 bemfa.com 失败，60 秒后重试\r\n");
+        return 0;
+    }
+
+    /* 3) 订阅主题（连接后不订阅会被服务器断开） */
+    {
+        char sub[128];
+        int  n = sprintf(sub, "cmd=1&uid=%s&topic=%s\r\n", BEMFA_UID, BEMFA_TOPIC);
+        if (!esp_send_conn(4, sub, n)) {
+            printf("  [云] 订阅主题失败，60 秒后重试\r\n");
+            return 0;
+        }
+    }
+
+    g_cloud_ok      = 1;
+    g_cloud_fail    = 0;
+    g_last_cloud_ms = millis();
+    printf("  [云] √ 已连接巴法云并订阅主题 %s（远程查看可用）\r\n", BEMFA_TOPIC);
+    return 1;
+}
+
+/* 把一条协议帧（append_crc 后的 *XX\r\n 结尾）发布到云端。
+ * 去掉行尾 CRLF 后作为 msg 内容；未连接时静默跳过（本地功能不受影响）。 */
+static void cloud_publish(const char *line)
+{
+    char pkt[256];
+    int  len = (int)strlen(line);
+    int  n;
+
+    if (!g_cloud_ok || !cloud_configured()) return;
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) len--;
+    if (len <= 0) return;
+
+    n = sprintf(pkt, "cmd=2&uid=%s&topic=%s&msg=%.*s\r\n",
+                BEMFA_UID, BEMFA_TOPIC, len, line);
+    if (n <= 0) return;
+
+    if (esp_send_conn(4, pkt, n)) {
+        g_last_cloud_ms = millis();
+        g_cloud_fail    = 0;
+    } else {
+        g_cloud_fail++;
+        printf("  [云] 发布失败（连续 %u 次）\r\n", (unsigned)g_cloud_fail);
+        if (g_cloud_fail >= 3) {
+            g_cloud_ok = 0;                 /* 通道可能已断，交给 cloud_task 重连 */
+            printf("  [云] 通道判定失效，60 秒后自动重连\r\n");
+        }
+    }
+}
+
+/* 主循环每拍调用（内部自带节流，不增加正常负载）：
+ *   · 已连接且 50 秒没发过数据 → 补一次 ping 保活（服务器 65 秒掉线）
+ *   · 未连接 → 每 60 秒完整重试一次（连 WiFi → 连云端 → 订阅）
+ * 注意：重试是阻塞操作（最长约 35 秒），期间 MAX30102 FIFO 会积压，
+ *       返回后立即补读 + 10 秒看门狗兜底，心率读数短暂恢复后正常。 */
+static void cloud_task(void)
+{
+    if (!g_esp_ok || !cloud_configured()) return;
+
+    if (g_cloud_ok && (millis() - g_last_cloud_ms) > 50000UL) {
+        if (esp_send_conn(4, "ping\r\n", 6)) {
+            g_last_cloud_ms = millis();
+        } else {
+            g_cloud_ok = 0;
+            printf("  [云] 保活失败，进入重连流程\r\n");
+        }
+    }
+
+    /* ★★★ 2026-11-01：开机最多连 3 次（esp_init 里 1 次 + 这里 2 次），之后放弃
+     *
+     * 【为什么改】cloud_reconnect() 是同步阻塞调用：AT+CWJAP 连热点默认等 15 秒，
+     *   热点不在范围就卡满超时，加 CXIPSTART + 订阅，一次能卡 27 秒。
+     *   实测抓包：21:53:27~21:53:54 零帧，同期 UP 从 1138 涨到 1165——
+     *   主循环被这个调用占住、FIFO 只进不出 → 溢出 → 心率掉 0 且难恢复。
+     *
+     * 【改成】esp_init 步骤7 已试过 1 次，这里最多再试 2 次、每次间隔 60 秒；
+     *   3 次都失败就彻底放弃，不再干扰采集与显示。要用云就断电重启。 */
+    if (!g_cloud_ok && g_cloud_try < 2 && (millis() - g_last_cloud_try) > 60000UL) {
+        g_last_cloud_try = millis();
+        g_cloud_try++;
+        printf("[云] 重试 %d/2（累计第 %d 次，共 3 次）...\r\n",
+               g_cloud_try, g_cloud_try + 1);
+        max30102_update();                  /* 重连前先清 FIFO，减少积压 */
+        cloud_reconnect();
+        max30102_update();
+        if (!g_cloud_ok && g_cloud_try >= 2) {
+            printf("[云] 三次均失败，本次开机不再重试\r\n");
+        }
+    }
 }
 
 /* ==================== 主程序 ==================== */
@@ -947,6 +1160,9 @@ int main(void)
             max30102_update();              /* ★ 刷完一页补喂 FIFO，避免积压 */
         }
 
+        /* --- ★ 2026-11-01 新增：云端通道维护（保活/重连，内部节流） --- */
+        cloud_task();
+
         /* --- ★ 每 2 秒：上传到手机（用 millis() 精确计时）--- */
         if ((millis() - s_last_send) >= 2000) {
             s_last_send = millis();
@@ -977,6 +1193,7 @@ int main(void)
                                             (unsigned long)(evt_ms / 1000UL));
                         if (n_evt > 0 && n_evt < 90) {
                             append_crc(line, (uint16_t)n_evt);
+                            cloud_publish(line);  /* ★ 2026-11-01：睡眠事件同步发云端（远程可见） */
                             /* ★ 2026-10-31：发送成功才出队。
                              *   原来 pop 之后无条件发送，断线时这条事件就没了，
                              *   "断线补发"名不副实。改成 peek → 发 → 成功才 pop。*/
@@ -1045,6 +1262,14 @@ int main(void)
             max30102_update();
             esp_send_data(line);
             max30102_update();
+
+            /* ★ 2026-11-01 新增：每 3 帧（约 6 秒）把最新数据发布到云端。
+             *   本地 2 秒一条不变；云端 6 秒一条足够远程实时查看。
+             *   云未连接时 cloud_publish 内部直接跳过。 */
+            if (n_send % 3 == 0) {
+                cloud_publish(line);
+                max30102_update();          /* 阻塞返回先补读 FIFO */
+            }
         }
 
     /* ========================================================================
