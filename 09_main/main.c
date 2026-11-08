@@ -63,10 +63,10 @@
  *   既不阻塞主循环，也不影响本地 TCP 与 OLED 显示。 */
 #define CLOUD_ENABLE 0
 
-#define BEMFA_UID    "cb8d43645910466bbbcbcefdc48eea70"   /* ←←← 替换成你的巴法云私钥 */
+#define BEMFA_UID    "PLEASE_SET_YOUR_BEMFA_UID"   /* 巴法云私钥：自行申请后填入，勿提交真实值 */
 #define BEMFA_TOPIC  "health004"              /* 主题名：仅字母数字，末三位 004=传感器类设备 */
-#define CLOUD_SSID   "Ophone X8"  /* ←←← 设备要连接的 WiFi 名称（手机热点/路由器） */
-#define CLOUD_PASS   "Echolove"  /* ←←← 对应的 WiFi 密码 */
+#define CLOUD_SSID   "PLEASE_SET_YOUR_WIFI_SSID"  /* 2.4GHz WiFi 名称 */
+#define CLOUD_PASS   "PLEASE_SET_YOUR_WIFI_PASS"  /* 对应的 WiFi 密码 */
 
 static uint8_t cloud_configured(void);            /* 用户是否已填写私钥 */
 static uint8_t cloud_reconnect(void);             /* 建立云端通道：WiFi→TCP→订阅 */
